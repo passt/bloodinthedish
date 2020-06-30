@@ -1,0 +1,612 @@
+---
+title: "Blood in the dish - single-cell label-transfer"
+author: "PS STUMPF"
+date: "13/02/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE} 
+knitr::opts_chunk$set(echo = TRUE)
+
+reticulate::use_condaenv(condaenv = 'kerasRTF', conda = '/Users/stumpf/opt/miniconda3/bin/conda', required = T)
+library(keras)
+
+library(dplyr)
+library(Seurat)
+
+source('./precision_recall_balAcc.R')
+```
+
+# Blood in the dish
+
+Cell type classification of test-tube-derived blood cells using fetal liver as a reference. Data are a collection of multiple specimen from both male and female embryos and developmental time points.
+
+## Import data
+
+See https://github.com/afidanza/scRNAseqHPC for data source and instructions on pre-processing.
+
+```{r ImportData}
+ # training data
+Liv <- readRDS('./data/SeuratLiverInVivo.rds')
+ 
+# test data
+HemaEndo <- readRDS('./data/SeuratObjHemaEndoDay10_13_2019.rds')
+d10_13   <- readRDS('./data/SeuratObjDay10_13_2019.rds')
+d13      <- readRDS('./data/SeuratObjDay13_2018.rds')
+```
+
+Number of training examples per class.
+
+```{r nExamplesTraining, fig.width=5, fig.asp=1}
+par(mar=c(4,15,2,.1))
+# training data
+Liv@active.ident %>% table(useNA='ifany') %>% log10 %>% sort %>% barplot(horiz = T, las = 1, xlab = expression(log[10] (n) ), cex.names = 0.75, main = 'Examples per class')
+```
+
+Variable genes - union of all data
+
+```{r SubsetDataToVarGenes}
+# extract names of variable genes. these genes have to be present in training and test data.
+varGOI <- union(VariableFeatures(Liv)[     VariableFeatures(Liv)      %in% rownames(HemaEndo)],
+                VariableFeatures(HemaEndo)[VariableFeatures(HemaEndo) %in% rownames(Liv)]     ) %>% unique
+
+# subset raw counts
+Li <- Liv@assays$RNA@counts[(Liv@assays$RNA@counts@Dimnames[[1]] %in% varGOI), ]
+HE <- HemaEndo@assays$RNA@counts[(HemaEndo@assays$RNA@counts@Dimnames[[1]] %in% varGOI), ]
+DT <- d13@assays$RNA@counts[(d13@assays$RNA@counts@Dimnames[[1]] %in% varGOI), ]
+
+# add features not present at d13
+missingfeatures <-  setdiff(Li@Dimnames[[1]], DT@Dimnames[[1]])
+DT <- rbind(DT, Matrix::Matrix(data = 0, nrow=length(missingfeatures), ncol = ncol(DT), dimnames = list(missingfeatures, colnames(DT))))
+
+# discretize: on-off
+Li <- (1*(Li>0))
+HE <- (1*(HE>0))
+DT <- (1*(DT>0))
+
+# reorder rows
+Li <- Li[(rownames(Li) %>% order), ]
+HE <- HE[(rownames(HE) %>% order), ]
+DT <- DT[(rownames(DT) %>% order), ]
+
+# extract labels
+y.Li <- Liv@active.ident
+y.HE <- HemaEndo@active.ident
+y.DT <- d13@active.ident
+```
+
+## Export data for ML
+
+```{r SaveSimplifiedData, eval=FALSE}
+# Training data (embryonic liver)
+saveRDS(Li, file='./data/Liver_bin.RDS')
+saveRDS(y.Li, file='./data/Liver_labels.RDS')
+
+# Test data (iPSC derived blood & endothelial cells)
+saveRDS(HE, file='./data/HemEnd_bin.RDS')
+saveRDS(y.HE, file='./data/HemEnd_labels.RDS')
+
+# Test data (iPSC-derived blood, day 13)
+saveRDS(DT, file='./data/DayThirteen_bin.RDS')
+saveRDS(y.DT, file='./data/DayThirteen_labels.RDS')
+```
+
+> **This is a stopping point.**
+
+## Re-import data for ML
+
+> **This is a starting point.**
+
+```{r ReloadDataForML}
+# Training data (embryonic liver)
+x.Liver <- readRDS(file = './data/Liver_bin.RDS')
+y.Liver <- readRDS(file = './data/Liver_labels.RDS')
+
+# Test data (iPSC derived blood & endothelial cells)
+x.HemEnd <- readRDS(file = './data/HemEnd_bin.RDS')
+y.HemEnd <- readRDS(file = './data/HemEnd_labels.RDS')
+
+# Test data (iPSC-derived blood, day 13)
+x.DT <- readRDS(file = './data/DayThirteen_bin.RDS')
+y.DT <- readRDS(file = './data/DayThirteen_labels.RDS')
+```
+
+
+## Additional filtering
+
+Some labels in fetal liver are NA. Remove cells without explicit label.
+
+```{r Filter}
+dim(x.Liver)
+
+# remove NA cells
+x.Liver <- x.Liver[, !is.na(y.Liver)]
+y.Liver <- y.Liver[!is.na(y.Liver)]
+
+dim(x.Liver)
+```
+
+
+## Reshape sparse matrix to full matrix.
+
+```{r ReshapeTrainingMat}
+cat('Reshaping array to conform with NN input layer... \n')
+dim(x.Liver)
+x.Liver <- x.Liver %>% Matrix::t() %>% Matrix::as.matrix() %>%
+              array_reshape(dim = c(ncol(x.Liver), nrow(x.Liver)))
+dim(x.Liver)
+```
+
+## One-hot representation of labels
+
+```{r OneHotLabels}
+# convert factor to numeric and substract 1 to obtain labels 0:25.
+y.train <- y.Liver %>% as.numeric - 1
+
+# convert labels to one-hot
+y.train <- y.train %>% keras::to_categorical(num_classes = (y.Liver %>% levels %>% length))
+
+# add column names to aid identification
+colnames(y.train) <- levels(y.Liver)
+```
+
+
+# Model training
+
+## K-fold cross-validation
+
+Sequentially initialize and train model using 5-fold cross-validation
+
+```{r PartitionDataForXVal, eval=FALSE}
+# number of partitions for k-fold cross validation
+ksplits=5
+
+# set up 5-fold cross validation
+kfold <- function(x, ksplits) {
+  # set up k-fold cross validation
+  n = length(x)
+  x = x[sample(1:n, size = n, replace=F)] # shuffle indices
+  split(x, cut(1:n, breaks = ksplits, labels=1:ksplits)) # split vector into folds
+}
+
+# split indices by population and split kfold
+xv.kfold <- lapply(split(1:length(y.Liver), y.Liver), kfold, ksplits=ksplits)
+
+# example: lapply(m.kfold, function(x){x[[k]]}) # for k-th fold
+```
+
+
+## Fit k models
+
+Each model has 3479 input units, 64 and 32 dense hidden layers and 28 output units.
+
+```{r FitGenerator, eval=FALSE}
+# run script
+source('./NN_fitGenerator_2hidden_64-32nodes.R')
+```
+
+## Save models
+
+```{r SaveModelToFile, eval=FALSE}
+# loop over folds and save model to file
+for (fold in 1:ksplits) {
+  save_model_hdf5(object = modell[[fold]],
+                  filepath = paste0('./models/2020-02-20-ML_NN_2hidden1softmax_Model',fold, '.hdf5'),
+                  include_optimizer = T,
+                  overwrite = F)
+}
+# save indices of folds and model predictions calculated during k-fold xval.
+save(xv.kfold, modell.predict, modell.predict.p, history, 
+     file = './models/2020-02-20-ML_NN_2hidden1softmax_Model_SplitIX-Pred.RData')
+```
+
+## Re-load models
+
+```{r reLoadSavedModel}
+# load 'xv.kfold' containing previous indices of x-val test sets
+load(file = './models/2020-02-20-ML_NN_2hidden1softmax_Model_SplitIX-Pred.RData')
+
+# initialise empty list for models
+modell <- list()
+
+# calc number of x-val folds from re-loaded data 
+ksplits = length(modell.predict)
+
+# loop over folds
+for (fold in 1:ksplits) {
+  # Load pre-trained models
+  modell[[fold]] <- load_model_hdf5(filepath =
+                                      paste0('./models/2020-02-20-ML_NN_2hidden1softmax_Model', fold,'.hdf5'))
+}
+
+```
+
+# Model performance
+
+Evaluation of models based on cross-validation.
+
+## Cross-validation
+
+Visualize training performance using confusion matrix.
+
+### Confusion Matrix
+
+```{r AccuracyConfusion, fig.width=6, fig.asp=1}
+
+# Average Confusion Matrix (percent)
+cfm.freq <- modell.predict %>% lapply(table) %>%
+  lapply(function(cfm) { cfm %>% apply(2, function(cfm.col) { cfm.col / sum(cfm.col) } ) }) %>%
+  abind::abind(along=3, use.dnns = T) %>% apply(MARGIN = 1:2, mean)
+
+# Order of rows & columns 
+cfm.order <- levels(y.Liver)[c(10, 26,27,25, 1, 11,5,23,22,24,21,2,3,20,18,19,12,28,7,16,14,15,4,17,13,6,8,9)]
+
+cfm.freq <- cfm.freq[cfm.order, cfm.order]
+
+# Visualize average across k-fold cross-val as heatmap
+heatmap(cfm.freq, scale='none', Rowv=NA, Colv=NA, revC=TRUE,
+        asp=1, cexRow=1, cexCol=1, margins=c(13,13),
+        col=marray::maPalette(low='#efefef', high='#08306b', k = 100))
+```
+
+## Overall Performance
+
+```{r}
+cat('Average performance:\n\n')
+modell.predict %>% lapply(function(x){table(x)[cfm.order, cfm.order]}) %>%
+                      lapply(precall) %>%
+                      data.table::rbindlist() %>%
+                      apply(2, mean)
+```
+
+```{r fig.width=5, fig.asp=1}
+
+# balanced accuracy
+bal <- modell.predict %>% lapply(function(x){table(x)[cfm.order, cfm.order]}) %>% lapply(function(x){precall(x)$'balanced Accuracy'}) %>% do.call(what=rbind)
+bal.mean <- bal %>% apply(2, mean) 
+
+par(mar=c(4,15,.1,1), xpd=NA)
+at <- bal.mean %>% sort(decreasing=T) %>% barplot(horiz=T, las=1, xlim=c(0,1), cex.names = .75, xlab='balanced accuracy')
+bal[, bal.mean %>% order(decreasing=T)] %>% as.data.frame %>% stripchart(at=at, add = T, pch=1)
+
+
+# Precision - how many identified are correct
+prec <- modell.predict %>% lapply(function(x){table(x)[cfm.order, cfm.order]}) %>% lapply(function(x){precall(x)$precision}) %>% do.call(what=rbind)
+prec.mean <- prec %>% apply(2, mean) 
+
+par(mar=c(4,15,.1,1), xpd=NA)
+at <- prec.mean %>% sort(decreasing=T) %>% barplot(horiz=T, las=1, xlim=c(0,1), cex.names = .75, xlab='Precision')
+prec[, prec.mean %>% order(decreasing=T)] %>% as.data.frame %>% stripchart(at=at, add = T, pch=1)
+
+# Recall - how many correct are identified
+reca <- modell.predict %>% lapply(function(x){table(x)[cfm.order, cfm.order]}) %>% lapply(function(x){precall(x)$recall}) %>% do.call(what=rbind)
+reca.mean <- reca %>% apply(2, mean) 
+
+par(mar=c(4,15,.1,1), xpd=NA)
+at <- reca.mean %>% sort(decreasing=T) %>% barplot(horiz=T, las=1, xlim=c(0,1), cex.names = .75, xlab='Recall')
+reca[, reca.mean %>% order(decreasing=T)] %>% as.data.frame %>% stripchart(at=at, add = T, pch=1)
+
+```
+
+# Label transfer
+
+## Hema-Endo (d10, d13)
+
+Reshape sparse matrix to full matrix.
+
+```{r}
+cat('Reshaping array to conform with NN input layer... \n')
+dim(x.HemEnd)
+x.HemEnd <- x.HemEnd %>% Matrix::t() %>% Matrix::as.matrix() %>%
+              array_reshape(dim = c(ncol(x.HemEnd), nrow(x.HemEnd)))
+dim(x.HemEnd)
+```
+
+
+Evaluate transfer learning.
+
+
+### Predict labels
+
+Predict human labels (and probabilities) using model trained exclusively on mouse data.
+
+```{r PredictHumanLabels-HE, fig.asp=1, fig.width=4}
+modell.predict.he.p <- modell %>%
+                        lapply(function(model) {
+                          model %>% predict(x.HemEnd)})
+
+# Predict labels for human data
+modell.predict.he <- modell %>%
+                        lapply(function(model) {
+                          model %>% predict(x.HemEnd) %>% apply(1, function(x){levels(y.Liver)[which.max(x)]})})
+
+# Establish consensus of predictions across all models (most frequent class - *MANAGE TIES*)
+modell.predict.he.consensus <- modell.predict.he %>%
+                                  abind::abind(along=2) %>%
+                                  apply(MARGIN = 1, function(labels) {
+                                    w <- labels %>% table() %>% sort(decreasing=T)
+                                    if ((max(w) >= 3) | (max(w)==2 & length(w) == 4)){ head(w, 1) %>% names
+                                      } else{ NA }
+                                    } ) 
+
+# write.table(modell.predict.he.consensus, file='2020-02-20-HE-predConsensus.txt', sep='', quote = F, row.names=F, col.names=F)
+```
+
+
+### Re-import labels
+
+```{r}
+predConsens_HemaEndo <- read.table(file = './models/2020-02-20-HE-predConsensus.txt', header = F, sep='\t', as.is = T)[,1] # 2020-02-20 Model
+predConsens_HemaEndo[is.na(predConsens_HemaEndo)] <- 'undetermined'
+
+HemaEndo <- Seurat::AddMetaData(object = HemaEndo, metadata = predConsens_HemaEndo, col.name = 'LiverLabel')
+```
+
+### Frequency table
+
+```{r ObservedRelativeFrequency, fig.asp=1, fig.width=6}
+obsrelfreq <- predConsens_HemaEndo %>% factor(levels=levels(y.Liver))
+
+obsrelfreq <- table(obsrelfreq, HemaEndo@meta.data[,8], useNA='ifany') / matrix(table(HemaEndo@meta.data[,8]), nrow = 1+length(levels(y.Liver)), ncol=2, byrow = T) * 100
+
+rownames(obsrelfreq) <- c(rownames(obsrelfreq)[-(1+length(levels(y.Liver)))], 'undetermined')
+
+obsrelfreq <- obsrelfreq[obsrelfreq %>% apply(1, sum) %>% order(decreasing = T),2:1]
+
+# Viz results
+par(mar=c(4,14,1,1))
+obsrelfreq %>% t %>% barplot(horiz=T, las=1, xlab='Rel. Frequency (%)', cex.names=.75, xlim=c(0,45), beside = T, col=c('#333333', '#888888'), border = F)
+legend('topright', legend=c('10 days', '13 days'), bty = 'n', fill = c('#888888', '#333333'), border = F)
+```
+
+### DimPlots
+
+```{r fig.width=16, fig.asp=.3}
+HemaEndo <- AddMetaData(HemaEndo, metadata = HemaEndo@meta.data[,8], col.name = 'Time')
+
+DimPlot(HemaEndo, group.by = c('Time', 'LiverLabel'), reduction = 'umap')
+```
+
+
+```{r fig.width=8, fig.height=6}
+plt <- list()
+
+for (population in (predConsens_HemaEndo %>% unique)[c(9,1, 10,5, 7,3)]) {
+  
+  cellshi <- list(colnames(HemaEndo)[predConsens_HemaEndo == population])
+  names(cellshi) <- population
+  
+  plt[[population]] <- DimPlot(HemaEndo, group.by = 'LiverLabel', reduction = 'umap', cells.highlight = cellshi)
+
+}
+
+cowplot::plot_grid(plotlist = plt, align = 'hv', ncol = 2)
+```
+
+
+```{r fig.width=10, fig.height=6}
+plt <- list()
+
+for (population in (predConsens_HemaEndo %>% unique)[c(8,4, 13,14, 6,2)]) {
+  
+  cellshi <- list(colnames(HemaEndo)[predConsens_HemaEndo == population])
+  names(cellshi) <- population
+  
+  plt[[population]] <- DimPlot(HemaEndo, group.by = 'LiverLabel', reduction = 'umap', cells.highlight = cellshi)
+
+}
+
+cowplot::plot_grid(plotlist = plt, align = 'hv', ncol = 2)
+```
+
+
+```{r fig.width=12, fig.height=8}
+plt <- list()
+
+for (population in (predConsens_HemaEndo %>% unique)[-c(9,1, 10,5, 7,3, 8,4, 13,14, 6,2)]) {
+  
+  cellshi <- list(colnames(HemaEndo)[predConsens_HemaEndo == population])
+  names(cellshi) <- population
+  
+  plt[[population]] <- DimPlot(HemaEndo, group.by = 'LiverLabel', reduction = 'umap', cells.highlight = cellshi)
+
+}
+
+cowplot::plot_grid(plotlist = plt, align = 'hv', ncol = 2)
+```
+
+
+
+
+
+## Day 13 (CD43neg)
+
+Reshape sparse matrix to full matrix.
+
+```{r}
+cat('Reshaping array to conform with NN input layer... \n')
+dim(x.DT)
+x.DT <- x.DT %>% Matrix::t() %>% Matrix::as.matrix() %>%
+  array_reshape(dim = c(ncol(x.DT), nrow(x.DT)))
+dim(x.DT)
+```
+
+
+### Predict labels
+
+Predict human labels (and probabilities) using model trained exclusively on mouse data.
+
+```{r PredictHumanLabels-DT, fig.asp=1, fig.width=4}
+# Predict labels for human data
+modell.predict.dt <- modell %>%
+  lapply(function(model) {
+    model %>% predict(x.DT) %>% apply(1, function(x){levels(y.Liver)[which.max(x)]})})
+
+# Establish consensus of predictions across all models (most frequent class - *MANAGE TIES*)
+modell.predict.dt.consensus <- modell.predict.dt %>%
+  abind::abind(along=2) %>%
+  apply(MARGIN = 1, function(labels) {
+    w <- labels %>% table() %>% sort(decreasing=T)
+    if ((max(w) >= 3) | (max(w)==2 & length(w) == 4)){ head(w, 1) %>% names
+    } else{ NA }
+  } ) 
+
+# modell.predict.dt.consensus %>% write.table(file = '2020-02-20-DT-predConsensus.txt', quote=F, col.names = F, row.names = F)
+
+# Add as metadata
+# hBMMNC@meta.data$NN_predict.consensus <- modell.predict.human.consensus
+```
+
+
+
+### Re-import labels
+
+```{r}
+predConsens_day13 <- read.table(file = './models/2020-02-20-DT-predConsensus.txt', header = F, sep='\t', as.is = T)[,1]
+predConsens_day13[is.na(predConsens_day13)] <- 'undetermined'
+
+d13 <- Seurat::AddMetaData(object = d13, metadata = predConsens_day13, col.name = 'LiverLabel')
+```
+
+### Frequency table
+```{r ObservedRelativeFrequency-DT, fig.asp=1.5, fig.width=5}
+obsrelfreq <- predConsens_day13 %>% factor(levels=levels(y.Liver))
+
+obsrelfreq <- 100 * table(obsrelfreq, useNA='ifany') / length(obsrelfreq)
+rownames(obsrelfreq) <- c(rownames(obsrelfreq)[-27], 'undetermined')
+
+obsrelfreq <- obsrelfreq[obsrelfreq %>% apply(1, sum) %>% order(decreasing = T)]
+
+# Viz results
+par(mar=c(4,14,1,1))
+obsrelfreq %>% t %>% barplot(horiz=T, las=1, xlab='Rel. Frequency (%)', cex.names=.75, xlim=c(0,50), border = F)
+```
+
+### DimPlots
+
+```{r}
+DimPlot(d13, group.by = c('LiverLabel'))
+```
+
+```{r fig.width=7, fig.height=6}
+plt <- list()
+
+for (population in ((table(predConsens_day13) %>% sort(decreasing = T) %>% names)[c(1,2, 4,3, 7,6)])) {
+  
+  cellshi <- list(colnames(d13)[predConsens_day13 == population])
+  names(cellshi) <- population
+  
+  plt[[population]] <- DimPlot(d13, group.by = 'LiverLabel', reduction = 'tsne', cells.highlight = cellshi)
+
+}
+
+cowplot::plot_grid(plotlist = plt, align = 'hv', ncol = 2)
+```
+
+
+
+```{r fig.width=9, fig.height=6}
+plt <- list()
+
+for (population in ((table(predConsens_day13) %>% sort(decreasing = T) %>% names)[c(5,8, 9,12, 11,10)])) {
+  
+  cellshi <- list(colnames(d13)[predConsens_day13 == population])
+  names(cellshi) <- population
+  
+  plt[[population]] <- DimPlot(d13, group.by = 'LiverLabel', reduction = 'tsne', cells.highlight = cellshi)
+
+}
+
+cowplot::plot_grid(plotlist = plt, align = 'hv', ncol = 2)
+```
+
+```{r fig.width=9, fig.height=8}
+plt <- list()
+
+for (population in ((table(predConsens_day13) %>% sort(decreasing = T) %>% names)[13:17])) {
+  
+  cellshi <- list(colnames(d13)[predConsens_day13 == population])
+  names(cellshi) <- population
+  
+  plt[[population]] <- DimPlot(d13, group.by = 'LiverLabel', reduction = 'tsne', cells.highlight = cellshi)
+
+}
+
+cowplot::plot_grid(plotlist = plt, align = 'hv', ncol = 2)
+```
+
+
+# Cell Distance
+
+
+## Define functions
+
+```{r}
+medianOffDiag <- function(x, MARGIN, dia = F) {
+  x <- x %>% as.matrix
+  if (!dia) { diag(x) <- NA }
+  y <- x %>% apply(MARGIN = MARGIN, median, na.rm=T)
+}
+```
+
+
+## Within / Between Cluster Distance to in vivo median centre
+
+```{r}
+celltypes <- c("Neutrophil-myeloid progenitor",
+               "Monocyte-DC precursor",
+               "Monocyte",
+               "Mono-Mac",
+               "MEMP",
+               "Megakaryocyte",
+               "Early Erythroid", "Mid  Erythroid", "Late Erythroid")
+
+goi <- intersect(Liv@assays$SCT@var.features, HemaEndo@assays$SCT@var.features)
+```
+
+## HSC comparison
+
+```{r}
+# celltype mouse human dist
+d.res.pred.hsc <- list()
+
+  coi.stem.li <- ((Liv@active.ident == 'HSC/MPP') & !is.na(Liv@active.ident))
+  stem.li <- Liv@assays$SCT@scale.data[goi, coi.stem.li]
+  stem.li.med <- stem.li %>% t %>% Gmedian::Gmedian(.)
+  
+  coi.stem.he <- ((predConsens_HemaEndo == 'HSC/MPP') & !is.na(predConsens_HemaEndo))
+  stem.he <- HemaEndo@assays$SCT@scale.data[goi, coi.stem.he]
+
+  d.res.pred.hsc[['in vitro']] <-
+  proxy::dist( x = stem.he,
+               y = stem.li.med %>% matrix(nrow = nrow(stem.he), ncol = ncol(stem.he), byrow = F),
+               method = 'euclidean', by_rows = F, pairwise = T, convert_similarities = F) %>%
+    medianOffDiag(MARGIN = 1, dia=T) %>% as.vector
+  
+  d.res.pred.hsc[['in vivo']] <-
+  proxy::dist( x = stem.li,
+               y = stem.li.med %>% matrix(nrow = nrow(stem.li), ncol = ncol(stem.li), byrow = F),
+               method = 'euclidean', by_rows = F, pairwise = T, convert_similarities = F) %>%
+    medianOffDiag(MARGIN = 1, dia=T) %>% as.vector
+  
+  
+for (celltype in celltypes){
+
+  coi.li <- ((Liv@active.ident == celltype) & !is.na(Liv@active.ident))
+  li <- Liv@assays$SCT@scale.data[goi, coi.li]
+  
+  d.res.pred.hsc[[celltype]] <-
+  proxy::dist( x = li,
+               y = stem.li.med %>% matrix(nrow = nrow(li), ncol = ncol(li), byrow = F),
+               method = 'euclidean', by_rows = F, pairwise = T, convert_similarities = F) %>%
+    medianOffDiag(MARGIN = 1, dia=T) %>% as.vector
+}
+
+```
+
+## Visualisation
+```{r}
+par(mar=c(3,12,1,.1))
+d.res.pred.hsc[c(11,5,8,4,6,10,7,3,9,2,1)] %>% 
+    boxplot(horizontal = T, las=1, xlab='L2 norm', ylim=c(0,570))
+```
