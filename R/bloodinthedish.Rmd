@@ -196,7 +196,7 @@ for (fold in 1:ksplits) {
                   overwrite = F)
 }
 # save indices of folds and model predictions calculated during k-fold xval.
-save(xv.kfold, modell.predict, modell.predict.p, history, 
+save(xv.kfold, modell.predict, modell.predict.p, history,
      file = '../models/2020-02-20-ML_NN_2hidden1softmax_Model_SplitIX-Pred.RData')
 ```
 
@@ -215,8 +215,8 @@ ksplits = length(modell.predict)
 # loop over folds
 for (fold in 1:ksplits) {
   # Load pre-trained models
-  modell[[fold]] <- load_model_hdf5(filepath =
-                                      paste0('../models/2020-02-20-ML_NN_2hidden1softmax_Model', fold,'.hdf5'))
+  modell[[fold]] <-
+    load_model_hdf5(filepath = paste0('../models/2020-02-20-ML_NN_2hidden1softmax_Model', fold,'.hdf5'))
 }
 
 ```
@@ -329,7 +329,7 @@ modell.predict.he.consensus <- modell.predict.he %>%
                                       } else{ NA }
                                     } ) 
 
-# write.table(modell.predict.he.consensus, file='./output/2020-02-20-HE-predConsensus.txt', sep='', quote = F, row.names=F, col.names=F)
+# write.table(modell.predict.he.consensus, file='../output/2020-02-20-HE-predConsensus.txt', sep='', quote = F, row.names=F, col.names=F)
 ```
 
 
