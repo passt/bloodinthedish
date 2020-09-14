@@ -5,4 +5,4 @@ Source code related to Fidanza et al. 2020 https://doi.org/10.1182/blood.2020006
 
 See the publication above and https://github.com/afidanza/ScRNAseq_HPC_humaniPSCs for data source and instructions on pre-processing.
 
-See passt.github.io/bloodinthedish to view the markdown for this analysis.
+See http://passt.github.io/bloodinthedish to view the markdown for this analysis.
